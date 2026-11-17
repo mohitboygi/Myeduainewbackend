@@ -4,5 +4,6 @@
   "compatibility_date": "2025-11-01",
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true },
-  "keep_vars": true
+  "keep_vars": true,
+  "alias": { "iconv-lite": "./lib/iconv-lite-stub.js" }
 }
