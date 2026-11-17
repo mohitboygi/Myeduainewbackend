@@ -1,0 +1,8 @@
+{
+  "name": "myeduainewbackend",
+  "main": "worker.js",
+  "compatibility_date": "2025-11-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+  "keep_vars": true
+}
