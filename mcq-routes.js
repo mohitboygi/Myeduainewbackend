@@ -1,24 +1,23 @@
-// MyEdu - MCQ routes for the existing Express app (server.js) running on Cloudflare Workers.
-// Put this file next to server.js. In server.js add:
-//     const mcqRoutes = require('./mcq-routes');
-//     app.use(mcqRoutes);      // place BEFORE any 404 / catch-all handler
-// Needs:  npm i @libsql/client      Env: TURSO_DATABASE_URL, TURSO_AUTH_TOKEN (already in your Worker variables)
-// Optional env: MCQ_TABLE (default "mcqs")
-const express = require('express');
-const { createClient } = require('@libsql/client/web');
+// MyEdu - MCQ routes served straight from Turso (no changes needed in server.js).
+// Used by worker.js:  const mcq = await handleMcq(request, env); if (mcq) return mcq;
+// Env (already in your Worker): TURSO_DATABASE_URL, TURSO_AUTH_TOKEN. Optional: MCQ_TABLE (default "mcqs").
+import { createClient } from '@libsql/client/web';
 
-const router = express.Router();
-let db = null;
+const CORS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+};
+const json = (obj, status = 200) =>
+  new Response(JSON.stringify(obj), { status, headers: { 'Content-Type': 'application/json', ...CORS } });
+
+const envVal = (env, k) => (env && env[k]) || (typeof process !== 'undefined' && process.env ? process.env[k] : undefined);
 let cachedMap = null;
 
-const getDb = () => db || (db = createClient({ url: process.env.TURSO_DATABASE_URL, authToken: process.env.TURSO_AUTH_TOKEN }));
-const table = () => process.env.MCQ_TABLE || 'mcqs';
-
-async function getMap() {
+async function getMap(db, table) {
   if (cachedMap) return cachedMap;
-  const t = table();
-  if (!/^[A-Za-z0-9_]+$/.test(t)) throw new Error('bad table name');
-  const info = await getDb().execute(`PRAGMA table_info(${t})`);
+  if (!/^[A-Za-z0-9_]+$/.test(table)) throw new Error('bad table name');
+  const info = await db.execute(`PRAGMA table_info(${table})`);
   const cols = info.rows.map((r) => String(r.name));
   const pick = (...n) => n.find((x) => cols.includes(x)) || null;
   const m = {
@@ -31,7 +30,7 @@ async function getMap() {
     answer: pick('answer', 'correct', 'correct_answer', 'correct_option', 'ans'),
   };
   if (!m.question || !m.chapter || !m.answer) {
-    console.log('MCQ unmapped columns', JSON.stringify({ table: t, cols }));
+    console.log('MCQ unmapped columns', JSON.stringify({ table, cols }));
     throw new Error('MCQ columns not recognised');
   }
   return (cachedMap = m);
@@ -56,45 +55,47 @@ function toQuestion(row, m) {
   return { id: m.id ? row[m.id] : undefined, question: row[m.question], options, answer: ans };
 }
 
-router.use('/api/mcq', (req, res, next) => {
-  res.set({ 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Content-Type, Authorization', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS' });
-  if (req.method === 'OPTIONS') return res.sendStatus(204);
-  next();
-});
+export async function handleMcq(request, env) {
+  const url = new URL(request.url);
+  if (!url.pathname.startsWith('/api/mcq')) return null;
+  if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS });
 
-router.get('/api/mcq/chapters', async (req, res) => {
   try {
-    const m = await getMap();
-    const cls = parseInt(req.query.class, 10);
-    const useG = m.grade && cls >= 6 && cls <= 12;
-    const r = await getDb().execute({
-      sql: `SELECT DISTINCT ${m.subject || "'General'"} AS subject, ${m.chapter} AS chapter FROM ${table()}
-            WHERE ${m.chapter} IS NOT NULL AND ${m.chapter} != '' ${useG ? `AND ${m.grade} = ?` : ''} ORDER BY 1, 2`,
-      args: useG ? [cls] : [],
-    });
-    const subjects = {};
-    for (const row of r.rows) (subjects[row.subject] ||= []).push(row.chapter);
-    res.json({ subjects });
-  } catch (e) { console.log('mcq chapters error', e && e.message); res.status(500).json({ error: 'MCQ server error' }); }
-});
+    const db = createClient({ url: envVal(env, 'TURSO_DATABASE_URL'), authToken: envVal(env, 'TURSO_AUTH_TOKEN') });
+    const table = envVal(env, 'MCQ_TABLE') || 'mcqs';
+    const m = await getMap(db, table);
 
-router.get('/api/mcq', async (req, res) => {
-  try {
-    const m = await getMap();
-    const chapter = String(req.query.chapter || '');
-    const subject = String(req.query.subject || '');
-    const cls = parseInt(req.query.class, 10);
-    const count = Math.min(Math.max(parseInt(req.query.count, 10) || 0, 0), 500);
-    const conds = [`${m.chapter} = ?`]; const args = [chapter];
-    if (m.subject && subject) { conds.push(`${m.subject} = ?`); args.push(subject); }
-    if (m.grade && cls >= 6 && cls <= 12) { conds.push(`${m.grade} = ?`); args.push(cls); }
-    const where = conds.join(' AND ');
-    const total = Number((await getDb().execute({ sql: `SELECT COUNT(*) AS n FROM ${table()} WHERE ${where}`, args })).rows[0].n);
-    const r = await getDb().execute({ sql: `SELECT * FROM ${table()} WHERE ${where} ORDER BY RANDOM() LIMIT ${count || 500}`, args });
-    res.json({ total, questions: r.rows.map((row) => toQuestion(row, m)) });
-  } catch (e) { console.log('mcq error', e && e.message); res.status(500).json({ error: 'MCQ server error' }); }
-});
+    if (url.pathname === '/api/mcq/chapters' && request.method === 'GET') {
+      const cls = parseInt(url.searchParams.get('class') || '', 10);
+      const useG = m.grade && cls >= 6 && cls <= 12;
+      const r = await db.execute({
+        sql: `SELECT DISTINCT ${m.subject || "'General'"} AS subject, ${m.chapter} AS chapter FROM ${table}
+              WHERE ${m.chapter} IS NOT NULL AND ${m.chapter} != '' ${useG ? `AND ${m.grade} = ?` : ''} ORDER BY 1, 2`,
+        args: useG ? [cls] : [],
+      });
+      const subjects = {};
+      for (const row of r.rows) (subjects[row.subject] ||= []).push(row.chapter);
+      return json({ subjects });
+    }
 
-router.post('/api/mcq/attempts', (req, res) => res.json({ ok: true }));
+    if (url.pathname === '/api/mcq' && request.method === 'GET') {
+      const chapter = url.searchParams.get('chapter') || '';
+      const subject = url.searchParams.get('subject') || '';
+      const cls = parseInt(url.searchParams.get('class') || '', 10);
+      const count = Math.min(Math.max(parseInt(url.searchParams.get('count') || '0', 10) || 0, 0), 500);
+      const conds = [`${m.chapter} = ?`]; const args = [chapter];
+      if (m.subject && subject) { conds.push(`${m.subject} = ?`); args.push(subject); }
+      if (m.grade && cls >= 6 && cls <= 12) { conds.push(`${m.grade} = ?`); args.push(cls); }
+      const where = conds.join(' AND ');
+      const total = Number((await db.execute({ sql: `SELECT COUNT(*) AS n FROM ${table} WHERE ${where}`, args })).rows[0].n);
+      const r = await db.execute({ sql: `SELECT * FROM ${table} WHERE ${where} ORDER BY RANDOM() LIMIT ${count || 500}`, args });
+      return json({ total, questions: r.rows.map((row) => toQuestion(row, m)) });
+    }
 
-module.exports = router;
+    if (url.pathname === '/api/mcq/attempts' && request.method === 'POST') return json({ ok: true });
+    return json({ error: 'Not found' }, 404);
+  } catch (e) {
+    console.log('mcq error', e && e.message);
+    return json({ error: 'MCQ server error' }, 500);
+  }
+}
