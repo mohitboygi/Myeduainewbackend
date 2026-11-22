@@ -12,8 +12,8 @@ const jwt = require('jsonwebtoken');
 const multer = require('multer');
 const rateLimit = require('express-rate-limit');
 const { norm: normCls, parseClasses, classAllowed, studentSeesClass, classNum } = require('./lib/scope');
-const sec = require('./lib/security');
-const registerLegal = require('./lib/legal');
+const sec = require('./security');
+const registerLegal = require('./legal');
 const turso = require('./lib/turso');
 const backup = require('./lib/backup');
 
