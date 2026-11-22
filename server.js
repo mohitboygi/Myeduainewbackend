@@ -12,17 +12,25 @@ const jwt = require('jsonwebtoken');
 const multer = require('multer');
 const rateLimit = require('express-rate-limit');
 const { norm: normCls, parseClasses, classAllowed, studentSeesClass, classNum } = require('./lib/scope');
+const sec = require('./lib/security');
+const registerLegal = require('./lib/legal');
 const turso = require('./lib/turso');
 const backup = require('./lib/backup');
 
 const {
-  DATABASE_URL, JWT_SECRET, PORT = 3000, ALLOWED_ORIGIN = '*',
+  DATABASE_URL, JWT_SECRET, PORT = 3000, ALLOWED_ORIGIN = 'https://myedu.pntr.dev', JWT_EXPIRES = '14d', BCRYPT_COST = '10', CONSENT_PEPPER,
   OWNER_EMAIL = 'mohityadavoffical1@gmail.com', SMTP_USER, SMTP_PASS,
   OWNER_LOGIN_ID = 'owner', OWNER_PASSWORD,
   GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN, DRIVE_FOLDER_ID,
   AI_ROUTER_URL, AI_ROUTER_KEY, AI_MODEL = 'auto',
 } = process.env;
 if (!DATABASE_URL || !JWT_SECRET) { console.error('Set DATABASE_URL and JWT_SECRET'); process.exit(1); }
+if (String(JWT_SECRET).length < 32) console.error('SECURITY WARNING: JWT_SECRET is shorter than 32 characters. Set a long random secret (changing it signs everyone out).');
+if (ALLOWED_ORIGIN === '*') console.error('SECURITY WARNING: ALLOWED_ORIGIN is * (any website may call this API). Set it to https://myedu.pntr.dev');
+// bcrypt cost 10 is the minimum we allow. Raise BCRYPT_COST only if your Worker plan has enough CPU time (each +1 doubles the work).
+const COST = Math.min(14, Math.max(10, parseInt(BCRYPT_COST, 10) || 10));
+const hashPw = (pw) => bcrypt.hash(String(pw), COST);
+const signToken = (u, tv) => jwt.sign({ id: u.id, role: u.role, inst: u.institution_id, tv }, JWT_SECRET, { algorithm: 'HS256', expiresIn: JWT_EXPIRES });
 
 const pool = require('./lib/db')(DATABASE_URL);
 const q = (text, params) => pool.query(text, params);
@@ -31,12 +39,15 @@ const IS_WORKER = require('./lib/db').isWorker;
 // rate limits keyed by the visitor's address (Cloudflare passes it in cf-connecting-ip)
 // the limiter is created on the first request (Workers do not allow timers while the file loads)
 const rl = (o) => { let mw; return (req, res, next) => { if (!mw) mw = rateLimit({ validate: false, keyGenerator: (r) => r.headers['cf-connecting-ip'] || r.ip || 'unknown', ...o }); return mw(req, res, next); }; };
+const limiter = sec.makeRateLimiter(q);
 const norm = (s) => String(s || '').trim().toLowerCase();
 const clean = (s) => String(s || '').trim();
 
 const app = express();
 app.set('trust proxy', 1);
-app.use(cors({ origin: ALLOWED_ORIGIN === '*' ? true : ALLOWED_ORIGIN.split(',') }));
+app.disable('x-powered-by');
+app.use(sec.securityHeaders);
+app.use(cors({ origin: ALLOWED_ORIGIN === '*' ? true : ALLOWED_ORIGIN.split(',').map((x) => x.trim()), methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization'], maxAge: 600 }));
 app.use(express.json({ limit: '200kb' }));
 
 // ---------- auth ----------
@@ -53,7 +64,7 @@ async function authState(id) {
 }
 function auth(...roles) {
   return async (req, res, next) => {
-    try { req.user = jwt.verify((req.headers.authorization || '').replace('Bearer ', ''), JWT_SECRET); }
+    try { req.user = jwt.verify(String(req.headers.authorization || '').replace(/^Bearer /, ''), JWT_SECRET, { algorithms: ['HS256'] }); }
     catch (e) { return res.status(401).json({ error: 'Please login again' }); }
     if (roles.length && !roles.includes(req.user.role)) return res.status(403).json({ error: 'Not allowed' });
     try {
@@ -64,6 +75,17 @@ function auth(...roles) {
     next();
   };
 }
+
+// signed in or not: used by public forms that may attach the user
+const optAuth = async (req, res, next) => {
+  req.user = null;
+  try {
+    const u = jwt.verify(String(req.headers.authorization || '').replace(/^Bearer /, ''), JWT_SECRET, { algorithms: ['HS256'] });
+    const st = await authState(u.id);
+    if (st.v !== null && st.v === Number(u.tv || 0) && (st.inst || '') === String(u.inst || '')) req.user = u;
+  } catch (e) { /* anonymous */ }
+  next();
+};
 
 // ---------- class-wise teacher control ----------
 // A teacher only sees and manages the classes the admin assigned ("10A,11"). Admin / tuition owner see everything.
@@ -103,17 +125,36 @@ async function teacherMayManage(req, targetId) {
   if (t.role === 'parent') return (t.children || []).some((c) => classAllowed(mine, c.className, c.division));
   return false;
 }
+// checks the fields of a new account (login ID, name, phone, email, class) and the password; returns an error message or null
+function personProblem(b, withPw = true) {
+  const id = norm(b.loginId);
+  if (!sec.isLoginId(id)) return 'Login ID must be 3 to 60 characters: letters, numbers and . _ @ + -';
+  if (clean(b.name).length > 120 || clean(b.adminName).length > 80) return 'Name is too long';
+  if (!sec.isEmail(clean(b.email))) return 'Email looks wrong';
+  if (!sec.isPhone(clean(b.phone))) return 'Phone number looks wrong';
+  for (const k of ['className', 'division', 'stream']) if (clean(b[k]).length > 40) return 'Class details are too long';
+  return withPw ? sec.pwProblem(b.password, id) : null;
+}
 const publicUser = (u) => ({ id: u.id, role: u.role, name: u.name, loginId: u.login_id, institutionId: u.institution_id, className: u.class_name, division: u.division, stream: u.stream, phone: u.phone });
 
-app.post('/api/login', rl({ windowMs: 15 * 60 * 1000, max: 30 }), ah(async (req, res) => {
-  const loginId = norm(req.body.loginId), code = clean(req.body.instCode).toUpperCase() || null, pw = String(req.body.password || '');
+let dummyHash;
+app.post('/api/login', rl({ windowMs: 15 * 60 * 1000, max: 30 }), limiter.limit({ name: 'login-ip', windowMs: 15 * 60 * 1000, max: 30 }), ah(async (req, res) => {
+  const b = req.body || {};
+  const loginId = norm(b.loginId), code = clean(b.instCode).toUpperCase() || null, pw = String(b.password || '');
+  if (!loginId || loginId.length > 60 || !pw || pw.length > 200 || (code && code.length > 20)) return res.status(400).json({ error: 'Enter your ID and password' });
+  // lock after repeated wrong passwords: 5 per ID from one address (15 min), or 25 per ID from anywhere (1 hour)
+  const kIp = 'lf:' + loginId + '|' + limiter.ip(req), kId = 'lfa:' + loginId, W1 = 15 * 60 * 1000, W2 = 60 * 60 * 1000;
+  if ((await limiter.peek(kIp, W1)) >= 5 || (await limiter.peek(kId, W2)) >= 25) { res.setHeader('Retry-After', '900'); return res.status(429).json({ error: 'Too many wrong attempts. Please wait 15 minutes and try again.' }); }
   const { rows } = await q(`SELECT u.*, i.active AS inst_active, i.type AS inst_type, i.name AS inst_name, i.code AS inst_code FROM users u LEFT JOIN institutions i ON i.id = u.institution_id WHERE u.login_id = $1 AND ($2::text IS NULL OR upper(i.code) = $2) LIMIT 20`, [loginId, code]);
   const ok = [];
   for (const u of rows) if (u.active && u.inst_active !== false && (await bcrypt.compare(pw, u.password_hash))) ok.push(u);
-  if (!ok.length) return res.status(401).json({ error: 'Wrong ID or password' });
+  if (!rows.length) await bcrypt.compare(pw, dummyHash || (dummyHash = await bcrypt.hash('not-a-real-password-1', COST)));   // same work whether or not the ID exists
+  if (!ok.length) { await limiter.fail(kIp, W1); await limiter.fail(kId, W2); return res.status(401).json({ error: 'Wrong ID or password' }); }
   if (ok.length > 1) return res.status(409).json({ error: 'This ID is used in more than one school or tuition. Choose one.', needsInstitution: true, options: ok.map((u) => ({ code: u.inst_code, name: u.inst_name, type: u.inst_type, role: u.role })) });
   const u = ok[0];
-  const token = jwt.sign({ id: u.id, role: u.role, inst: u.institution_id, tv: Number(u.token_version || 0) }, JWT_SECRET, { expiresIn: '30d' });
+  await limiter.clear(kIp);
+  if (bcrypt.getRounds(u.password_hash) < COST) await hashPw(pw).then((h) => q('UPDATE users SET password_hash=$1 WHERE id=$2', [h, u.id])).catch(() => {});   // upgrade old hashes
+  const token = signToken(u, Number(u.token_version || 0));
   res.json({ token, user: { ...publicUser(u), institutionType: u.inst_type, institutionName: u.inst_name, institutionCode: u.inst_code } });
 }));
 app.get('/api/me', auth(), ah(async (req, res) => {
@@ -128,10 +169,10 @@ app.get('/api/me', auth(), ah(async (req, res) => {
 }));
 // ---------- get started form -> saved in PostgreSQL + emailed to the owner ----------
 const mailer = SMTP_USER && SMTP_PASS ? require('nodemailer').createTransport({ service: 'gmail', auth: { user: SMTP_USER, pass: SMTP_PASS } }) : null;
-app.post('/api/leads', rl({ windowMs: 60 * 60 * 1000, max: 20 }), ah(async (req, res) => {
+app.post('/api/leads', rl({ windowMs: 60 * 60 * 1000, max: 20 }), limiter.limit({ name: 'leads', windowMs: 60 * 60 * 1000, max: 10 }), ah(async (req, res) => {
   const b = req.body || {};
-  const lead = { type: b.type === 'tuition' ? 'tuition' : 'school', inst: clean(b.instName).slice(0, 120), person: clean(b.personName).slice(0, 80), phone: clean(b.phone).slice(0, 30), email: clean(b.email).slice(0, 120), students: clean(b.students).slice(0, 20) };
-  if (!lead.inst || !lead.person || !lead.phone || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(lead.email)) return res.status(400).json({ error: 'Fill all fields' });
+  const lead = { type: b.type === 'tuition' ? 'tuition' : 'school', inst: sec.text(b.instName, 120), person: sec.text(b.personName, 80), phone: sec.text(b.phone, 30), email: sec.text(b.email, 120), students: sec.text(b.students, 20) };
+  if (!lead.inst || !lead.person || !lead.phone || !lead.email || !sec.isPhone(lead.phone) || !sec.isEmail(lead.email)) return res.status(400).json({ error: 'Fill all fields with a valid phone and email' });
   await q('INSERT INTO leads (type, inst_name, person_name, phone, email, students) VALUES ($1,$2,$3,$4,$5,$6)', [lead.type, lead.inst, lead.person, lead.phone, lead.email, lead.students]);
   if (mailer) {
     mailer.sendMail({
@@ -145,7 +186,7 @@ app.post('/api/leads', rl({ windowMs: 60 * 60 * 1000, max: 20 }), ah(async (req,
 
 // ---------- app owner (Mohit): leads + create institution accounts ----------
 app.get('/api/owner/leads', auth('owner'), ah(async (req, res) => res.json((await q('SELECT * FROM leads ORDER BY created_at DESC')).rows)));
-app.patch('/api/owner/leads/:id', auth('owner'), ah(async (req, res) => { await q('UPDATE leads SET status=$1 WHERE id=$2', [clean(req.body.status), req.params.id]); res.json({ ok: true }); }));
+app.patch('/api/owner/leads/:id', auth('owner'), ah(async (req, res) => { await q('UPDATE leads SET status=$1 WHERE id=$2', [sec.text(req.body.status, 30), req.params.id]); res.json({ ok: true }); }));
 app.get('/api/owner/institutions', auth('owner'), ah(async (req, res) => res.json((await q(`SELECT i.*, (SELECT COUNT(*) FROM users s WHERE s.institution_id=i.id AND s.role='student') AS students, (SELECT COUNT(*) FROM users t WHERE t.institution_id=i.id AND t.role='teacher') AS teachers FROM institutions i ORDER BY i.created_at DESC`)).rows)));
 app.get('/api/owner/stats', auth('owner'), ah(async (req, res) => res.json((await q(`SELECT
   (SELECT COUNT(*) FROM institutions) AS institutions,
@@ -164,9 +205,10 @@ const newInstCode = () => { const b = crypto.randomBytes(6); let s = ''; for (le
 app.post('/api/owner/institutions', auth('owner'), ah(async (req, res) => {
   const b = req.body || {};
   const type = b.type === 'tuition' ? 'tuition' : 'school';
-  if (!clean(b.name) || !clean(b.adminName) || !clean(b.loginId) || String(b.password || '').length < 6) return res.status(400).json({ error: 'Name, admin name, login ID and password (min 6) required' });
+  if (!clean(b.name) || !clean(b.adminName) || !clean(b.loginId) || !b.password) return res.status(400).json({ error: 'Name, admin name, login ID and password required' });
+  { const pe = personProblem(b); if (pe) return res.status(400).json({ error: pe }); }
   if (norm(b.loginId) === norm(OWNER_LOGIN_ID)) return res.status(409).json({ error: 'Login ID already taken' });
-  const hash = await bcrypt.hash(String(b.password), 10);
+  const hash = await hashPw(b.password);
   for (let attempt = 0; attempt < 5; attempt++) {
     const client = await pool.connect();
     try {
@@ -190,7 +232,8 @@ app.delete('/api/owner/institutions/:id', auth('owner'), ah(async (req, res) => 
 // ---------- people: owner/admin -> teachers ; teacher -> students + parents ----------
 async function createUser(req, res, role, extra = {}) {
   const b = req.body || {};
-  if (!clean(b.name) || !clean(b.loginId) || String(b.password || '').length < 6) return res.status(400).json({ error: 'Name, login ID and password (min 6) required' });
+  if (!clean(b.name) || !clean(b.loginId) || !b.password) return res.status(400).json({ error: 'Name, login ID and password required' });
+  { const pe = personProblem(b); if (pe) return res.status(400).json({ error: pe }); }
   if (norm(b.loginId) === norm(OWNER_LOGIN_ID)) return res.status(409).json({ error: 'Login ID already taken' });
   if (req.user.role === 'teacher' && role === 'student') {
     const mine = await myClasses(req.user);
@@ -198,7 +241,7 @@ async function createUser(req, res, role, extra = {}) {
     if (!canClass(mine, b.className, b.division)) return res.status(403).json({ error: 'You can only add students to your own classes' });
   }
   try {
-    const hash = await bcrypt.hash(String(b.password), 10);
+    const hash = await hashPw(b.password);
     const { rows } = await q('INSERT INTO users (institution_id, role, login_id, password_hash, name, phone, email, class_name, division, stream, created_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *',
       [req.user.inst, role, norm(b.loginId), hash, clean(b.name), clean(b.phone), clean(b.email), clean(b.className) || null, clean(b.division) || null, clean(b.stream) || null, req.user.id]);
     if (extra.studentId) await q('INSERT INTO parent_student (parent_id, student_id) VALUES ($1,$2) ON CONFLICT DO NOTHING', [rows[0].id, extra.studentId]);
@@ -225,7 +268,7 @@ const deleteUser = (role) => ah(async (req, res) => {
 // reset someone's password: owner -> any admin; admin -> own teachers/students/parents; teacher -> own students/parents
 app.post('/api/users/:id/password', auth('owner', 'admin', 'inst_owner', 'teacher'), ah(async (req, res) => {
   const pw = String((req.body && req.body.password) || '');
-  if (pw.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+  { const pe = sec.pwProblem(pw); if (pe) return res.status(400).json({ error: pe }); }
   const target = (await q('SELECT id, role, institution_id FROM users WHERE id=$1', [req.params.id])).rows[0];
   if (!target) return res.status(404).json({ error: 'User not found' });
   const me = req.user;
@@ -235,21 +278,23 @@ app.post('/api/users/:id/password', auth('owner', 'admin', 'inst_owner', 'teache
   else if (me.role === 'admin' || me.role === 'inst_owner') ok = ['teacher', 'student', 'parent'].includes(target.role);
   else if (me.role === 'teacher') ok = ['student', 'parent'].includes(target.role) && (await teacherMayManage(req, target.id));
   if (!ok) return res.status(403).json({ error: 'Not allowed' });
-  await q('UPDATE users SET password_hash=$1, token_version=token_version+1 WHERE id=$2', [await bcrypt.hash(pw, 10), target.id]);
+  await q('UPDATE users SET password_hash=$1, token_version=token_version+1 WHERE id=$2', [await hashPw(pw), target.id]);
   authCache.delete(String(target.id));
   res.json({ ok: true });
 }));
 // change my own password (all roles). Old sessions stop working; a fresh token is returned.
 app.post('/api/me/password', auth(), rl({ windowMs: 15 * 60 * 1000, max: 10, keyGenerator: (req) => 'u' + req.user.id }), ah(async (req, res) => {
   const { oldPassword, newPassword } = req.body || {};
-  if (String(newPassword || '').length < 6) return res.status(400).json({ error: 'New password must be at least 6 characters' });
+  { const pe = sec.pwProblem(newPassword); if (pe) return res.status(400).json({ error: pe }); }
   const u = (await q('SELECT * FROM users WHERE id=$1', [req.user.id])).rows[0];
   if (!u || !(await bcrypt.compare(String(oldPassword || ''), u.password_hash))) return res.status(400).json({ error: 'Current password is wrong' });
   const nv = Number(u.token_version || 0) + 1;
-  await q('UPDATE users SET password_hash=$1, token_version=$2 WHERE id=$3', [await bcrypt.hash(String(newPassword), 10), nv, u.id]);
+  await q('UPDATE users SET password_hash=$1, token_version=$2 WHERE id=$3', [await hashPw(newPassword), nv, u.id]);
   authCache.delete(String(u.id));
-  res.json({ ok: true, token: jwt.sign({ id: u.id, role: u.role, inst: u.institution_id, tv: nv }, JWT_SECRET, { expiresIn: '30d' }) });
+  res.json({ ok: true, token: signToken(u, nv) });
 }));
+// sign out of every device
+app.post('/api/me/logout-all', auth(), ah(async (req, res) => { await q('UPDATE users SET token_version=token_version+1 WHERE id=$1', [req.user.id]); authCache.delete(String(req.user.id)); res.json({ ok: true }); }));
 // admin edits a teacher (name, classes, subject, phone)
 app.patch('/api/teachers/:id', auth('admin', 'inst_owner'), ah(async (req, res) => {
   const b = req.body || {};
@@ -279,9 +324,12 @@ app.delete('/api/parents/:id', auth('teacher'), deleteUser('parent'));
 app.post('/api/attendance', auth('teacher'), ah(async (req, res) => {
   const day = clean(req.body.date) || new Date().toISOString().slice(0, 10);
   const records = Array.isArray(req.body.records) ? req.body.records : [];
+  if (!sec.isDay(day)) return res.status(400).json({ error: 'Invalid date' });
+  if (records.length > 1000) return res.status(400).json({ error: 'Too many records' });
   const mine = await myClasses(req.user);
   let absent = 0;
   for (const r of records) {
+    if (!r || !Number.isInteger(Number(r.studentId))) continue;
     const st = (await q("SELECT id, name, class_name, division FROM users WHERE id=$1 AND institution_id=$2 AND role='student'", [r.studentId, req.user.inst])).rows[0];
     if (!st || !canClass(mine, st.class_name, st.division)) continue;
     const status = r.status === 'absent' ? 'absent' : 'present';
@@ -299,6 +347,7 @@ app.post('/api/attendance', auth('teacher'), ah(async (req, res) => {
 // staff: attendance of one day for the whole institution (teacher marks, admin watches live)
 app.get('/api/attendance', auth('teacher', 'admin', 'inst_owner'), ah(async (req, res) => {
   const day = clean(req.query.date) || new Date().toISOString().slice(0, 10);
+  if (!sec.isDay(day)) return res.status(400).json({ error: 'Invalid date' });
   const mine = await myClasses(req.user);
   const rows = (await q('SELECT a.student_id AS "studentId", a.status, u.class_name, u.division FROM attendance a JOIN users u ON u.id=a.student_id WHERE a.institution_id=$1 AND a.day=$2', [req.user.inst, day])).rows;
   res.json(rows.filter((r) => canClass(mine, r.class_name, r.division)).map(({ studentId, status }) => ({ studentId, status })));
@@ -316,6 +365,7 @@ app.post('/api/notifications/read', auth(), ah(async (req, res) => { await q('UP
 app.post('/api/announcements', auth('admin', 'inst_owner', 'teacher'), ah(async (req, res) => {
   const aud = ['all', 'students', 'parents', 'teachers'].includes(req.body.audience) ? req.body.audience : 'all';
   if (!clean(req.body.title)) return res.status(400).json({ error: 'Title required' });
+  if (clean(req.body.title).length > 150 || clean(req.body.body).length > 3000) return res.status(400).json({ error: 'Title or message is too long' });
   let target = null;   // null = whole institution (admin only); otherwise the classes it is for
   const mine = await myClasses(req.user);
   if (mine) {
@@ -359,7 +409,7 @@ async function mayUseDoc(user, d) {
 }
 app.post('/api/documents', auth('teacher'), upload.single('file'), ah(async (req, res) => {
   const f = req.file;
-  if (!f || f.mimetype !== 'application/pdf' || !clean(req.body.title)) return res.status(400).json({ error: 'Send a PDF file and a title' });
+  if (!f || f.mimetype !== 'application/pdf' || !sec.sniffOk('application/pdf', f.buffer) || !clean(req.body.title) || clean(req.body.title).length > 150) return res.status(400).json({ error: 'Send a PDF file and a title' });
   const mine = await myClasses(req.user);
   if (!mine.length) return res.status(403).json({ error: NO_CLASSES });
   if (clean(req.body.className) && !canClass(mine, req.body.className, '')) return res.status(403).json({ error: 'You can only upload for your own classes' });
@@ -394,7 +444,7 @@ app.delete('/api/documents/:id', auth('teacher', 'admin', 'inst_owner'), ah(asyn
   res.json({ ok: !!d });
 }));
 // ---------- MyEduAI study helper -> your Render AI router (API key stays on the server) ----------
-app.post('/api/ai/chat', auth('student', 'teacher', 'parent', 'admin', 'inst_owner'), rl({ windowMs: 60 * 1000, max: 12, keyGenerator: (req) => 'u' + req.user.id }), ah(async (req, res) => {
+app.post('/api/ai/chat', auth('student', 'teacher', 'parent', 'admin', 'inst_owner'), limiter.limit({ name: 'ai', windowMs: 60 * 1000, max: 12, key: (req) => 'u' + req.user.id }), limiter.limit({ name: 'ai-day', windowMs: 24 * 60 * 60 * 1000, max: 150, key: (req) => 'u' + req.user.id }), ah(async (req, res) => {
   if (!AI_ROUTER_URL || !AI_ROUTER_KEY) return res.status(503).json({ error: 'AI is not connected yet' });
   const b = req.body || {};
   const msg = clean(b.message).slice(0, 2000);
@@ -420,6 +470,7 @@ const uploadHw = multer({ storage: multer.memoryStorage(), limits: { fileSize: 1
 app.post('/api/files', auth('student', 'teacher', 'admin', 'inst_owner'), uploadHw.single('file'), ah(async (req, res) => {
   const f = req.file;
   if (!f) return res.status(400).json({ error: 'Choose a file' });
+  if (!sec.sniffOk(f.mimetype, f.buffer)) return res.status(400).json({ error: 'This file does not look like its type. Upload a real PDF, image, Word or text file' });
   if (!/^(application\/pdf|image\/(png|jpe?g|webp)|application\/msword|application\/vnd\.openxmlformats-officedocument\.wordprocessingml\.document|text\/plain)$/.test(f.mimetype)) return res.status(400).json({ error: 'Only PDF, image, Word or text files are allowed' });
   let d;
   try { d = drive(); } catch (e) { return res.status(503).json({ error: 'File upload is not set up yet' }); }
@@ -507,6 +558,7 @@ app.put('/api/v2/:kind/:id', auth(), ah(async (req, res) => {
   if (!cfg) return res.status(404).json({ error: 'Unknown type' });
   if (!req.user.inst) return res.status(403).json({ error: 'Not allowed' });
   const id = clean(req.params.id).slice(0, 80);
+  if (!/^[\w.:@|-]{1,80}$/.test(id)) return res.status(400).json({ error: 'Invalid id' });
   const data = req.body && req.body.data;
   if (!id || !data || typeof data !== 'object' || Array.isArray(data)) return res.status(400).json({ error: 'Invalid data' });
   const inst = String(req.user.inst);
@@ -724,9 +776,13 @@ async function seedMcq() {
   } catch (e) { await client.query('ROLLBACK'); throw e; }
   finally { client.release(); }
 }
+registerLegal(app, { q, ah, auth, optAuth, limiter, pepper: CONSENT_PEPPER || JWT_SECRET });
 app.get('/', (req, res) => res.json({ app: 'MyEduAI backend', ok: true }));
+app.use('/api', (req, res) => res.status(404).json({ error: 'Not found' }));
 app.use((err, req, res, next) => {
   if (err && err.code === 'LIMIT_FILE_SIZE') return res.status(400).json({ error: 'File too large (max 10 MB)' });
+  if (err && (err.type === 'entity.parse.failed' || err.type === 'entity.too.large')) return res.status(err.type === 'entity.too.large' ? 413 : 400).json({ error: err.type === 'entity.too.large' ? 'Request is too large' : 'Invalid request' });
+  if (err && ['22P02', '22007', '22008', '22003', '22001', '23502', '23514'].includes(err.code)) return res.status(400).json({ error: 'Invalid input' });
   console.error(err);
   // while DEBUG=1 is set in the Worker variables, show the real reason (remove DEBUG when everything works)
   res.status(500).json({ error: process.env.DEBUG === '1' ? 'Server error: ' + String((err && err.message) || err).slice(0, 200) : 'Server error' });
@@ -770,7 +826,7 @@ async function startup() {
     size INT, uploaded_by TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now())`);
   if (OWNER_PASSWORD) {
     const has = (await q("SELECT 1 FROM users WHERE role='owner' LIMIT 1")).rowCount;
-    if (!has) { await q("INSERT INTO users (role, login_id, password_hash, name, email) VALUES ('owner',$1,$2,'Mohit Yadav',$3)", [norm(OWNER_LOGIN_ID), await bcrypt.hash(OWNER_PASSWORD, 10), OWNER_EMAIL]); console.log('Owner account created'); }
+    if (!has) { await q("INSERT INTO users (role, login_id, password_hash, name, email) VALUES ('owner',$1,$2,'Mohit Yadav',$3)", [norm(OWNER_LOGIN_ID), await hashPw(OWNER_PASSWORD), OWNER_EMAIL]); console.log('Owner account created'); }
   }
 }
 module.exports = { app, startup };
