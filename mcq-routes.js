@@ -1,11 +1,11 @@
 // MyEdu - MCQ routes for the existing Express app (server.js) running on Cloudflare Workers.
 // Put this file next to server.js. In server.js add:
-//     import mcqRoutes from './mcq-routes.js';
+//     const mcqRoutes = require('./mcq-routes');
 //     app.use(mcqRoutes);      // place BEFORE any 404 / catch-all handler
 // Needs:  npm i @libsql/client      Env: TURSO_DATABASE_URL, TURSO_AUTH_TOKEN (already in your Worker variables)
 // Optional env: MCQ_TABLE (default "mcqs")
-import express from 'express';
-import { createClient } from '@libsql/client/web';
+const express = require('express');
+const { createClient } = require('@libsql/client/web');
 
 const router = express.Router();
 let db = null;
@@ -97,4 +97,4 @@ router.get('/api/mcq', async (req, res) => {
 
 router.post('/api/mcq/attempts', (req, res) => res.json({ ok: true }));
 
-export default router;
+module.exports = router;
